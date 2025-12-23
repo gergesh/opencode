@@ -154,7 +154,254 @@ export function Prompt(props: PromptProps) {
   const fileStyleId = syntax().getStyleId("extmark.file")!
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
+  const pasteSelectedStyleId = syntax().getStyleId("extmark.paste.selected")!
   let promptPartTypeId: number
+
+  // Track which extmark is currently highlighted (cursor is at its boundary)
+  let highlightedExtmarkId: number | null = null
+
+  // Get the extmark at a given position (if cursor is inside or at boundary)
+  function getExtmarkAt(offset: number) {
+    const allExtmarks = input.extmarks.getAllForTypeId(promptPartTypeId)
+    for (const extmark of allExtmarks) {
+      // Check if offset is within extmark bounds (inclusive)
+      if (offset >= extmark.start && offset <= extmark.end) {
+        return extmark
+      }
+    }
+    return null
+  }
+
+  // Get part info for an extmark
+  function getPartForExtmark(extmarkId: number) {
+    const partIndex = store.extmarkToPartIndex.get(extmarkId)
+    if (partIndex === undefined) return null
+    const part = store.prompt.parts[partIndex]
+    if (!part) return null
+    return { part, partIndex }
+  }
+
+  // Check if a part is expandable (pasted text with source)
+  function isExpandablePart(part: (typeof store.prompt.parts)[0]) {
+    return part?.type === "text" && part.text && part.source?.text
+  }
+
+  // Update extmark style (highlight/unhighlight)
+  function setExtmarkHighlight(extmarkId: number, highlighted: boolean) {
+    const extmark = input.extmarks.get(extmarkId)
+    if (!extmark) return extmarkId
+
+    const partInfo = getPartForExtmark(extmarkId)
+    if (!partInfo || !isExpandablePart(partInfo.part)) return extmarkId
+
+    const newStyleId = highlighted ? pasteSelectedStyleId : pasteStyleId
+
+    // Recreate extmark with new style
+    input.extmarks.delete(extmarkId)
+    const newId = input.extmarks.create({
+      start: extmark.start,
+      end: extmark.end,
+      virtual: true,
+      styleId: newStyleId,
+      typeId: promptPartTypeId,
+    })
+
+    // Update the mapping
+    setStore("extmarkToPartIndex", (map: Map<number, number>) => {
+      const newMap = new Map(map)
+      newMap.delete(extmarkId)
+      newMap.set(newId, partInfo.partIndex)
+      return newMap
+    })
+
+    return newId
+  }
+
+  // Update highlighting based on cursor position - only highlight expandable parts at boundary
+  function updateAttachmentHighlight() {
+    const cursorOffset = input.cursorOffset
+    const extmarkAtCursor = getExtmarkAt(cursorOffset)
+
+    // Check if we're at the start of an expandable extmark
+    let shouldHighlight: typeof extmarkAtCursor = null
+    if (extmarkAtCursor) {
+      const partInfo = getPartForExtmark(extmarkAtCursor.id)
+      if (partInfo && isExpandablePart(partInfo.part)) {
+        // Only highlight if cursor is at the start of the extmark
+        if (cursorOffset === extmarkAtCursor.start) {
+          shouldHighlight = extmarkAtCursor
+        }
+      }
+    }
+
+    // Update highlighting if changed
+    if (shouldHighlight && highlightedExtmarkId !== shouldHighlight.id) {
+      // Unhighlight previous
+      if (highlightedExtmarkId !== null) {
+        setExtmarkHighlight(highlightedExtmarkId, false)
+      }
+      // Highlight new
+      highlightedExtmarkId = setExtmarkHighlight(shouldHighlight.id, true)
+    } else if (!shouldHighlight && highlightedExtmarkId !== null) {
+      // Unhighlight when no longer at boundary
+      setExtmarkHighlight(highlightedExtmarkId, false)
+      highlightedExtmarkId = null
+    }
+  }
+
+  // Delete an attachment (extmark + part)
+  function deleteAttachment(extmarkId: number) {
+    const extmark = input.extmarks.get(extmarkId)
+    if (!extmark) return false
+
+    const partIndex = store.extmarkToPartIndex.get(extmarkId)
+
+    // Delete the text in the input (extmark text + trailing space if present)
+    input.cursorOffset = extmark.start
+    const startLogical = input.logicalCursor
+
+    // Check if there's a trailing space after the extmark
+    const textAfterExtmark = input.plainText.slice(extmark.end)
+    const hasTrailingSpace = textAfterExtmark.startsWith(" ")
+    const deleteEnd = hasTrailingSpace ? extmark.end + 1 : extmark.end
+
+    input.cursorOffset = deleteEnd
+    const endLogical = input.logicalCursor
+    input.deleteRange(startLogical.row, startLogical.col, endLogical.row, endLogical.col)
+
+    // Delete the extmark
+    input.extmarks.delete(extmarkId)
+
+    // Update store
+    setStore(
+      produce((draft) => {
+        draft.extmarkToPartIndex.delete(extmarkId)
+        if (partIndex !== undefined) {
+          // Mark as deleted by setting to undefined (preserve indices)
+          draft.prompt.parts[partIndex] = undefined as any
+        }
+      }),
+    )
+
+    // Position cursor at where the attachment was
+    input.cursorOffset = extmark.start
+
+    // Clear highlight tracking if we deleted the highlighted one
+    if (highlightedExtmarkId === extmarkId) {
+      highlightedExtmarkId = null
+    }
+
+    return true
+  }
+
+  // Expand a pasted text attachment inline
+  function expandAttachment(extmarkId: number) {
+    const extmark = input.extmarks.get(extmarkId)
+    if (!extmark) return false
+
+    const partInfo = getPartForExtmark(extmarkId)
+    if (!partInfo || !isExpandablePart(partInfo.part)) return false
+
+    const part = partInfo.part as {
+      type: "text"
+      text: string
+      source: { text: { start: number; end: number; value: string } }
+    }
+
+    // Delete the virtual text + trailing space
+    input.cursorOffset = extmark.start
+    const startLogical = input.logicalCursor
+
+    const textAfterExtmark = input.plainText.slice(extmark.end)
+    const hasTrailingSpace = textAfterExtmark.startsWith(" ")
+    const deleteEnd = hasTrailingSpace ? extmark.end + 1 : extmark.end
+
+    input.cursorOffset = deleteEnd
+    const endLogical = input.logicalCursor
+    input.deleteRange(startLogical.row, startLogical.col, endLogical.row, endLogical.col)
+
+    // Insert the actual pasted text
+    input.cursorOffset = extmark.start
+    input.insertText(part.text + " ")
+
+    // Delete the extmark and clear the part's source
+    input.extmarks.delete(extmarkId)
+    setStore(
+      produce((draft) => {
+        draft.extmarkToPartIndex.delete(extmarkId)
+        if (draft.prompt.parts[partInfo.partIndex]) {
+          draft.prompt.parts[partInfo.partIndex] = {
+            ...draft.prompt.parts[partInfo.partIndex],
+            source: undefined,
+          }
+        }
+      }),
+    )
+
+    // Position cursor at end of inserted text
+    input.cursorOffset = extmark.start + Bun.stringWidth(part.text) + 1
+
+    // Clear highlight tracking
+    if (highlightedExtmarkId === extmarkId) {
+      highlightedExtmarkId = null
+    }
+
+    return true
+  }
+
+  // Handle cursor movement - skip over attachments as atomic units
+  function handleCursorMovement(direction: "left" | "right"): boolean {
+    const cursorOffset = input.cursorOffset
+    const allExtmarks = input.extmarks.getAllForTypeId(promptPartTypeId)
+
+    if (direction === "right") {
+      // Check if we're at the start of an extmark - skip to end + 1
+      for (const extmark of allExtmarks) {
+        if (cursorOffset === extmark.start) {
+          // Check if there's a trailing space
+          const textAfterExtmark = input.plainText.slice(extmark.end)
+          const hasTrailingSpace = textAfterExtmark.startsWith(" ")
+          input.cursorOffset = hasTrailingSpace ? extmark.end + 1 : extmark.end
+          queueMicrotask(() => updateAttachmentHighlight())
+          return true
+        }
+      }
+    } else if (direction === "left") {
+      // Check if we're right after an extmark (at end + 1 for trailing space, or at end)
+      for (const extmark of allExtmarks) {
+        const textAfterExtmark = input.plainText.slice(extmark.end)
+        const hasTrailingSpace = textAfterExtmark.startsWith(" ")
+        const positionAfterExtmark = hasTrailingSpace ? extmark.end + 1 : extmark.end
+
+        if (cursorOffset === positionAfterExtmark || cursorOffset === extmark.end) {
+          input.cursorOffset = extmark.start
+          queueMicrotask(() => updateAttachmentHighlight())
+          return true
+        }
+      }
+    }
+
+    return false
+  }
+
+  // Handle backspace - delete attachment if at its boundary
+  function handleBackspace(): boolean {
+    const cursorOffset = input.cursorOffset
+    const allExtmarks = input.extmarks.getAllForTypeId(promptPartTypeId)
+
+    // Check if we're right after an extmark
+    for (const extmark of allExtmarks) {
+      const textAfterExtmark = input.plainText.slice(extmark.end)
+      const hasTrailingSpace = textAfterExtmark.startsWith(" ")
+      const positionAfterExtmark = hasTrailingSpace ? extmark.end + 1 : extmark.end
+
+      if (cursorOffset === positionAfterExtmark) {
+        return deleteAttachment(extmark.id)
+      }
+    }
+
+    return false
+  }
 
   command.register(() => {
     return [
@@ -1019,6 +1266,46 @@ export function Prompt(props: PromptProps) {
                   }
                 }
                 if (store.mode === "normal") autocomplete.onKeyDown(e)
+
+                // Handle atomic attachment navigation and actions
+                if (!autocomplete.visible) {
+                  // Arrow keys - skip over attachments as atomic units
+                  if (e.name === "right" && !e.shift) {
+                    if (handleCursorMovement("right")) {
+                      e.preventDefault()
+                      return
+                    }
+                  }
+                  if (e.name === "left" && !e.shift) {
+                    if (handleCursorMovement("left")) {
+                      e.preventDefault()
+                      return
+                    }
+                  }
+
+                  // Backspace - delete entire attachment if at its boundary
+                  if (e.name === "backspace") {
+                    if (handleBackspace()) {
+                      e.preventDefault()
+                      return
+                    }
+                  }
+
+                  // Space - expand paste attachment if cursor is at its start
+                  if (e.name === "space") {
+                    const cursorOffset = input.cursorOffset
+                    const extmark = getExtmarkAt(cursorOffset)
+                    if (extmark && cursorOffset === extmark.start) {
+                      const partInfo = getPartForExtmark(extmark.id)
+                      if (partInfo && isExpandablePart(partInfo.part)) {
+                        e.preventDefault()
+                        expandAttachment(extmark.id)
+                        return
+                      }
+                    }
+                  }
+                }
+
                 if (!autocomplete.visible) {
                   if (
                     (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
@@ -1042,6 +1329,10 @@ export function Prompt(props: PromptProps) {
                   if (keybind.match("history_next", e) && input.visualCursor.visualRow === input.height - 1)
                     input.cursorOffset = input.plainText.length
                 }
+
+                // Update paste extmark highlighting after cursor movement
+                // Use queueMicrotask to run after the default key handler processes movement
+                queueMicrotask(() => updateAttachmentHighlight())
               }}
               onSubmit={submit}
               onPaste={async (event: PasteEvent) => {
@@ -1110,7 +1401,10 @@ export function Prompt(props: PromptProps) {
                   input.cursorColor = theme.text
                 }, 0)
               }}
-              onMouseDown={(r: MouseEvent) => r.target?.focus()}
+              onMouseDown={(r: MouseEvent) => {
+                r.target?.focus()
+                queueMicrotask(() => updateAttachmentHighlight())
+              }}
               focusedBackgroundColor={theme.backgroundElement}
               cursorColor={theme.text}
               syntaxStyle={syntax()}
