@@ -22,11 +22,22 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      # GitHub token - enables git operations with private repos
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       # Git user config - set these to use your own identity for commits
       - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-shuvcode}
       - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-shuvcode@localhost}
       - GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-shuvcode}
       - GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-shuvcode@localhost}
+    # Configure git credentials if GITHUB_TOKEN is set, then run shuvcode
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -n "$$GITHUB_TOKEN" ]; then
+          git config --global credential.helper '!f() { echo username=x-access-token; echo password=$$GITHUB_TOKEN; }; f'
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+        fi
+        exec shuvcode serve --port 4096 --hostname 0.0.0.0
     working_dir: /workspace
     restart: unless-stopped
 
